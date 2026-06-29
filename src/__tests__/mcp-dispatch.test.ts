@@ -36,7 +36,7 @@ describe("mcp-dispatch", () => {
     expect(body.result.serverInfo.name).toBe("keel")
   })
 
-  it("tools/list returns empty array (stub)", async () => {
+  it("tools/list returns all registered tools (non-empty)", async () => {
     const { handleMcp } = await import("../mcp-dispatch.ts")
     const token = await getToken()
     const req = new Request("http://localhost/mcp", {
@@ -49,9 +49,13 @@ describe("mcp-dispatch", () => {
     })
     const res = await handleMcp(req)
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { result: { tools: unknown[] } }
+    const body = (await res.json()) as { result: { tools: Array<{ name: string }> } }
     expect(Array.isArray(body.result.tools)).toBe(true)
-    expect(body.result.tools.length).toBe(0)
+    expect(body.result.tools.length).toBeGreaterThan(0)
+    const names = body.result.tools.map((t) => t.name)
+    expect(names).toContain("provision_ct")
+    expect(names).toContain("deploy")
+    expect(names).toContain("destroy_service")
   })
 
   it("rejects request without bearer token (401)", async () => {
