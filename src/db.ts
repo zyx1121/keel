@@ -1,6 +1,7 @@
 import type { SQL } from "bun"
 
 import { config } from "./config.ts"
+import { splitSqlStatements } from "./sql-split.ts"
 
 // Bun.SQL is the built-in postgres client (Bun 1.1+).
 // Prefer DATABASE_URL; fall back to individual PG* vars.
@@ -141,11 +142,9 @@ CREATE INDEX IF NOT EXISTS repo_bindings_repo_branch_idx
 
 export async function runMigration() {
   const sql = getSql()
-  // Split on semicolons and run each statement; Bun.SQL doesn't support multi-statement strings.
-  const statements = MIGRATION.split(";")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0)
-  for (const stmt of statements) {
+  // $$-aware split — Bun.SQL runs one statement per unsafe() call, but DO blocks
+  // must stay intact (see splitSqlStatements).
+  for (const stmt of splitSqlStatements(MIGRATION)) {
     await sql.unsafe(stmt)
   }
 }
