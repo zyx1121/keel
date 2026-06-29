@@ -144,6 +144,22 @@ function assertString(value: unknown, field: string): string {
   return value
 }
 
+// WHY: name is used as a hostname, systemd unit name, path component, and
+// subdomain — all of which require hostname-safe identifiers.  Allowing shell
+// metacharacters here would let a repo-controlled keel.yaml inject commands
+// via the sh -c interpolations in deploy-engine.ts.
+const NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/
+
+function assertName(value: unknown): string {
+  const s = assertString(value, "name")
+  if (!NAME_RE.test(s)) {
+    throw new Error(
+      `keel.yaml: field 'name' must match ^[a-z0-9][a-z0-9-]{0,62}$ (hostname-safe identifier)`,
+    )
+  }
+  return s
+}
+
 function assertRuntime(value: unknown): Runtime {
   const r = assertString(value, "runtime")
   if (!VALID_RUNTIMES.has(r as Runtime)) {
@@ -182,7 +198,7 @@ export function parseKeelConfig(raw: string): KeelConfig {
     throw new Error("keel.yaml: document must be a YAML mapping")
   }
 
-  const name = assertString(parsed.name, "name")
+  const name = assertName(parsed.name)
   const runtime = assertRuntime(parsed.runtime)
   const port = assertPort(parsed.port)
 
