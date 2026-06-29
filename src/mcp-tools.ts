@@ -177,13 +177,17 @@ async function handleBindService(args: Record<string, unknown>): Promise<unknown
     // Record repo binding if provided
     if (repoUrl) {
       const repoFull = repoUrl.replace("https://github.com/", "")
+      const storedYaml = keelYaml ?? null
+      const branch = typeof args["branch"] === "string" ? args["branch"] : "main"
       await sql`
-        INSERT INTO keel.repo_bindings (service_id, repo_full)
-        VALUES (${existing.id}, ${repoFull})
-        ON CONFLICT (repo_full) DO NOTHING
+        INSERT INTO keel.repo_bindings (service_id, repo_full, default_branch, keel_yaml)
+        VALUES (${existing.id}, ${repoFull}, ${branch}, ${storedYaml})
+        ON CONFLICT (repo_full) DO UPDATE
+          SET keel_yaml = EXCLUDED.keel_yaml,
+              default_branch = EXCLUDED.default_branch
       `
     } else if (config?.name) {
-      // keel.yaml was provided but no explicit repo_url — skip binding (V2 adds via install)
+      // keel.yaml was provided but no explicit repo_url — skip binding (V2 adds via bind_repo)
     }
 
     // Update service port/health in DB
@@ -699,6 +703,64 @@ async function handleListSecretKeys(args: Record<string, unknown>): Promise<unkn
   }
 }
 
+// 12. bind_repo — V2: persist full keel.yaml + repo metadata for webhook auto-deploy
+async function handleBindRepo(args: Record<string, unknown>): Promise<unknown> {
+  const name = args["name"] as string | undefined
+  const repo = args["repo"] as string | undefined          // "owner/name"
+  const branch = (args["branch"] as string | undefined) ?? "main"
+  const installationId = args["installation_id"] as number | undefined
+  const keelYaml = args["keel_yaml"] as string | undefined
+
+  if (!name) return { error: "name is required" }
+  if (!repo) return { error: "repo is required (owner/name format)" }
+  if (!keelYaml) return { error: "keel_yaml is required for webhook auto-deploy" }
+  if (!installationId || typeof installationId !== "number") return { error: "installation_id is required (GitHub App installation id)" }
+
+  // Validate keel_yaml is parseable
+  let parsedConfig
+  try {
+    parsedConfig = parseKeelConfig(keelYaml)
+  } catch (e) {
+    return { error: `keel_yaml parse error: ${(e as Error).message}` }
+  }
+  if (parsedConfig.name !== name) {
+    return { error: `keel_yaml name '${parsedConfig.name}' must match service name '${name}'` }
+  }
+
+  const existing = await getServiceByName(name)
+  if (!existing) return { error: `service '${name}' not found — run provision_ct first` }
+
+  const sql = getSql()
+  try {
+    await sql`
+      INSERT INTO keel.repo_bindings (service_id, repo_full, default_branch, keel_yaml, installation_id)
+      VALUES (${existing.id}, ${repo}, ${branch}, ${keelYaml}, ${installationId})
+      ON CONFLICT (repo_full) DO UPDATE
+        SET default_branch  = EXCLUDED.default_branch,
+            keel_yaml        = EXCLUDED.keel_yaml,
+            installation_id  = EXCLUDED.installation_id
+    `
+
+    await auditLog(existing.id, "bind_repo", {
+      repo,
+      branch,
+      installation_id: installationId,
+      // keel_yaml stored; not logged here to keep audit payload small
+    })
+
+    return {
+      ok: true,
+      name,
+      repo,
+      branch,
+      installation_id: installationId,
+      port: parsedConfig.port,
+    }
+  } catch (e) {
+    return { error: (e as Error).message }
+  }
+}
+
 // ── Tool registry ──────────────────────────────────────────────────────────────
 
 export const TOOLS: ToolDef[] = [
@@ -857,5 +919,21 @@ export const TOOLS: ToolDef[] = [
       required: ["name"],
     },
     handler: handleListSecretKeys,
+  },
+  {
+    name: "bind_repo",
+    description: "Bind a GitHub repo to a service for webhook auto-deploy (V2). Stores keel.yaml + installation_id so a git push triggers automatic deploy without inline keel_yaml.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Service name (must already exist via provision_ct)" },
+        repo: { type: "string", description: "GitHub repo in owner/name format (e.g. zyx1121/danmu)" },
+        branch: { type: "string", description: "Branch to watch (default: main)" },
+        installation_id: { type: "number", description: "GitHub App installation id (from GitHub App settings)" },
+        keel_yaml: { type: "string", description: "Full keel.yaml content to use for this repo/branch" },
+      },
+      required: ["name", "repo", "installation_id", "keel_yaml"],
+    },
+    handler: handleBindRepo,
   },
 ]

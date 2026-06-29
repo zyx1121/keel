@@ -447,12 +447,13 @@ describe("mcp-tools — deploy", () => {
 })
 
 describe("mcp-tools — tools/list via dispatch (non-empty)", () => {
-  it("TOOLS registry has 11 tools", async () => {
+  it("TOOLS registry has 12 tools", async () => {
     const { TOOLS } = await import("../mcp-tools.ts")
-    expect(TOOLS.length).toBe(11)
+    expect(TOOLS.length).toBe(12)
     const names = TOOLS.map((t) => t.name)
     expect(names).toContain("provision_ct")
     expect(names).toContain("bind_service")
+    expect(names).toContain("bind_repo")
     expect(names).toContain("unbind_service")
     expect(names).toContain("deploy")
     expect(names).toContain("rollback")
@@ -466,7 +467,7 @@ describe("mcp-tools — tools/list via dispatch (non-empty)", () => {
 })
 
 describe("mcp-tools — dispatch tools/list returns non-empty", () => {
-  it("tools/list returns all 11 tools via MCP dispatch", async () => {
+  it("tools/list returns all 12 tools via MCP dispatch", async () => {
     const { handleMcp } = await import("../mcp-dispatch.ts")
     const { config } = await import("../config.ts")
     const req = new Request("http://localhost/mcp", {
@@ -480,6 +481,6 @@ describe("mcp-tools — dispatch tools/list returns non-empty", () => {
     const res = await handleMcp(req)
     expect(res.status).toBe(200)
     const body = (await res.json()) as { result: { tools: unknown[] } }
-    expect(body.result.tools.length).toBe(11)
+    expect(body.result.tools.length).toBe(12)
   })
 })

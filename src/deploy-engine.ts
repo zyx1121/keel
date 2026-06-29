@@ -13,7 +13,7 @@
 //   - cloneToken is embedded into the clone URL argv element only; it is never
 //     written to the result log or any state file.
 
-import type { KeelConfig } from "./contract.ts"
+import type { KeelConfig, Runtime } from "./contract.ts"
 
 // ── Executor interface (dependency-injection surface) ─────────────────────────
 
@@ -281,6 +281,101 @@ async function appendDeployLog(
   await exec.run(lxc, ["sh", "-c", `mkdir -p ${stateDir(name)} && printf '%s\\n' "${line}" >> ${path}`])
 }
 
+// ── ensureRuntime — idempotent toolchain bootstrap ───────────────────────────
+//
+// WHY here (not in provision): provision runs on PVE (via utils pve create-ct).
+// The target LXC starts as a bare Ubuntu image. The deploy-engine is the only
+// component that SSHs into the target LXC, so toolchain bootstrap lives here.
+//
+// Idempotency: each installer is gated by a `which <binary>` check.
+// If the binary already exists, the installation block is skipped entirely.
+//
+// [ACCEPTED-RISK] We run the official vendor install scripts over HTTPS
+// (bun.sh/install, setup_*.x script from nodesource, astral-sh/uv installer).
+// This is standard practice for Bun / Node / uv. The LXC has firewall rules
+// limiting outbound to known hosts (configured at provision time).
+
+export async function ensureRuntime(
+  exec: LxcExecutor,
+  lxc: string,
+  runtime: Runtime,
+  log: string[],
+): Promise<boolean> {
+  // Ensure base utilities are present (git clone, curl for install scripts, unzip for bun)
+  const baseCheck = await exec.run(lxc, ["sh", "-c",
+    "dpkg -l git curl unzip 2>/dev/null | grep -c '^ii' | grep -q '3' && echo ok || apt-get install -y git curl unzip",
+  ])
+  if (baseCheck.code !== 0) {
+    log.push(`[runtime] WARNING: could not ensure base tools: ${baseCheck.stderr.trim()}`)
+    // Non-fatal: continue — maybe they're already installed differently
+  } else {
+    log.push(`[runtime] base tools (git/curl/unzip) ok`)
+  }
+
+  if (runtime === "static") {
+    log.push(`[runtime] static — no toolchain needed`)
+    return true
+  }
+
+  if (runtime === "bun") {
+    // Check if bun is already installed
+    const check = await exec.run(lxc, ["sh", "-c", "which bun >/dev/null 2>&1 && echo installed"])
+    if (check.code === 0 && check.stdout.includes("installed")) {
+      log.push(`[runtime] bun already installed — skip`)
+      return true
+    }
+    log.push(`[runtime] installing bun...`)
+    const install = await exec.run(lxc, ["sh", "-c",
+      "curl -fsSL https://bun.sh/install | bash && ln -sf $HOME/.bun/bin/bun /usr/local/bin/bun",
+    ])
+    if (install.code !== 0) {
+      log.push(`[runtime] bun install FAILED: ${install.stderr.trim()}`)
+      return false
+    }
+    log.push(`[runtime] bun installed ok`)
+    return true
+  }
+
+  if (runtime === "node") {
+    const check = await exec.run(lxc, ["sh", "-c", "which node >/dev/null 2>&1 && echo installed"])
+    if (check.code === 0 && check.stdout.includes("installed")) {
+      log.push(`[runtime] node already installed — skip`)
+      return true
+    }
+    log.push(`[runtime] installing node via nodesource...`)
+    const install = await exec.run(lxc, ["sh", "-c",
+      "curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && apt-get install -y nodejs",
+    ])
+    if (install.code !== 0) {
+      log.push(`[runtime] node install FAILED: ${install.stderr.trim()}`)
+      return false
+    }
+    log.push(`[runtime] node installed ok`)
+    return true
+  }
+
+  if (runtime === "python") {
+    const check = await exec.run(lxc, ["sh", "-c", "which uv >/dev/null 2>&1 && echo installed"])
+    if (check.code === 0 && check.stdout.includes("installed")) {
+      log.push(`[runtime] uv already installed — skip`)
+      return true
+    }
+    log.push(`[runtime] installing uv...`)
+    const install = await exec.run(lxc, ["sh", "-c",
+      "curl -LsSf https://astral.sh/uv/install.sh | sh && ln -sf $HOME/.local/bin/uv /usr/local/bin/uv",
+    ])
+    if (install.code !== 0) {
+      log.push(`[runtime] uv install FAILED: ${install.stderr.trim()}`)
+      return false
+    }
+    log.push(`[runtime] uv installed ok`)
+    return true
+  }
+
+  log.push(`[runtime] unknown runtime '${runtime}' — skipping toolchain bootstrap`)
+  return true
+}
+
 // ── Generate systemd unit content ─────────────────────────────────────────────
 
 function buildSystemdUnit(config: KeelConfig, sha: string): string {
@@ -398,6 +493,13 @@ export async function deploy(
   const previousSha = await readCurrentSha(exec, lxc, name)
   log.push(`[deploy] start sha=${sha} previous=${previousSha ?? "none"} lxc=${lxc}`)
 
+  // ── Step 0: ensure runtime toolchain is installed ───────────────────────────
+  const runtimeOk = await ensureRuntime(exec, lxc, runtime, log)
+  if (!runtimeOk) {
+    log.push(`[deploy] ABORTED: runtime bootstrap failed for '${runtime}'`)
+    return { status: "failure", sha, previousSha: null, rolledBackTo: null, log }
+  }
+
   // ── Step 1: ensure release dirs ─────────────────────────────────────────────
   const relBase = releasesBase(name)
   await exec.run(lxc, ["mkdir", "-p", relBase, `/srv/${name}/shared`])
@@ -462,6 +564,14 @@ export async function deploy(
       log.push(`[systemd] wrote ${unitPath}`)
     }
     await exec.run(lxc, ["systemctl", "daemon-reload"])
+    // Enable the service so it auto-starts on boot (idempotent — enable is safe to
+    // call on an already-enabled unit; daemon-reload must come first).
+    const enableRes = await exec.run(lxc, ["systemctl", "enable", name])
+    if (enableRes.code !== 0) {
+      log.push(`[systemd] warning: could not enable ${name}: ${enableRes.stderr.trim()}`)
+    } else {
+      log.push(`[systemd] enabled ${name} (boot auto-start)`)
+    }
   }
 
   // ── Step 5: atomic symlink swap ────────────────────────────────────────────
