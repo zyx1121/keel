@@ -1,0 +1,27 @@
+# keel.yaml — keel self-deploy descriptor (V1.6)
+# keel orchestrates its own LXC via this file.
+
+name: keel
+runtime: bun
+
+repo:
+  build_path: .
+
+build:
+  install: bun install --frozen-lockfile
+  command: bun run build
+
+run:
+  command: bun run start
+
+port: 8080
+
+health:
+  url: http://localhost:8080/healthz
+  timeout: 30
+
+env_file: /etc/keel/keel.env
+
+expose:
+  internal: keel.internal
+  public: keel.app.zyx.tw

@@ -82,7 +82,7 @@ async function handleProvisionCt(args: Record<string, unknown>): Promise<unknown
   try {
     const ct = await pveCreateCt(name, opts, getMcpPveExecutor())
     await auditLog(null, "provision_ct", { name, vmid: ct.vmid, ip: ct.ip })
-    return { ok: true, vmid: ct.vmid, ip: ct.ip, hostname: ct.hostname, status: ct.status }
+    return { ok: true, vmid: ct.vmid, ip: ct.ip, name: ct.name, status: ct.status }
   } catch (e) {
     return { error: (e as Error).message }
   }
