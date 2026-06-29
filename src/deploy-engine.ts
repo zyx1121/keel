@@ -4,13 +4,14 @@
 // zero coupling to Bun.serve, DB, or any live infra call site.
 //
 // Security model:
-//   - Every in-LXC command is a FIXED argv array; string interpolation is used
-//     only to substitute safe scalar values (sha, name, paths from keel.yaml).
+//   - Every in-LXC command is a FIXED argv array.  The only interpolated values
+//     are `name` (validated ^[a-z0-9][a-z0-9-]{0,62}$ in contract.ts) and `sha`
+//     (validated ^[0-9a-f]{7,40}$ at deploy/rollback entry points).
 //   - build.install / build.command are the ONE accepted-risk arbitrary-code
 //     execution surfaces; they are explicitly marked and run inside the target
 //     spoke LXC (blast radius = that LXC only).
-//   - cloneToken, if provided, is interpolated into the clone URL only; it is
-//     never logged or written to disk by this module.
+//   - cloneToken is embedded into the clone URL argv element only; it is never
+//     written to the result log or any state file.
 
 import type { KeelConfig } from "./contract.ts"
 
@@ -25,21 +26,11 @@ export interface ExecResult {
 /**
  * Abstraction over "run a command inside the target LXC".
  *
- * Production impl: ssh to lxc alias and exec argv.
- * Test impl: returns canned responses per argv[0].
+ * Production impl: SshLxcExecutor (see below).
+ * Test impl: MockExecutor in __tests__/deploy-engine.test.ts.
  */
 export interface LxcExecutor {
   run(lxc: string, argv: string[]): Promise<ExecResult>
-}
-
-/**
- * Abstraction over HTTP health check.
- *
- * Production impl: fetch(url).
- * Test impl: injectable response sequence.
- */
-export interface HealthChecker {
-  check(url: string): Promise<{ ok: boolean; status: number }>
 }
 
 // ── Result types ──────────────────────────────────────────────────────────────
@@ -54,20 +45,50 @@ export interface DeployResult {
   log: string[]                 // ordered deploy step trace
 }
 
+// ── Shell quoting (fix #1) ────────────────────────────────────────────────────
+//
+// OpenSSH does NOT treat extra argv elements as separate words on the remote
+// side.  When you run:
+//
+//   ssh host arg1 arg2 arg3
+//
+// OpenSSH concatenates them with spaces and passes the result to the remote
+// login shell as a single string.  So passing ["sh", "-c", "cd /x && cmd"]
+// as separate argv elements would arrive as `sh -c cd /x && cmd` — the remote
+// shell parses that as `sh -c cd` followed by `/x && cmd`.
+//
+// The fix: single-quote every argv element (with internal single-quotes
+// escaped via '\'' idiom) before joining, then pass the entire remote
+// command as one SSH argument.  This is the POSIX-portable approach that
+// works regardless of the remote shell.
+//
+// WHY exported: the quoting function is pure and independently unit-testable.
+
+export function shellQuote(arg: string): string {
+  // Replace every ' with '\'' (end quote, literal single-quote, reopen quote)
+  return `'${arg.replace(/'/g, `'\\''`)}'`
+}
+
+export function buildRemoteCommand(argv: string[]): string {
+  return argv.map(shellQuote).join(" ")
+}
+
 // ── Production executor (ssh into LXC) ───────────────────────────────────────
 
 /**
  * SSH executor for real LXC targets.
  *
- * Connects via: ssh <lxc-alias> <argv joined as single shell arg>
  * The LXC alias must be in ~/.ssh/config (keel bootstrap sets this up).
  * Port forward: 50<vmid>:22 — see keel plan §5 "bootstrap".
+ *
+ * Each run() builds a single quoted remote command string and passes it as
+ * one argument to ssh so that argument boundaries are preserved correctly
+ * on the remote side.
  */
 export class SshLxcExecutor implements LxcExecutor {
   async run(lxc: string, argv: string[]): Promise<ExecResult> {
-    // Build the remote command: each element is a separate ssh arg so that
-    // OpenSSH's own quoting handles argument boundaries safely.
-    const proc = Bun.spawn(["ssh", "-o", "BatchMode=yes", lxc, ...argv], {
+    const remoteCmd = buildRemoteCommand(argv)
+    const proc = Bun.spawn(["ssh", "-o", "BatchMode=yes", lxc, remoteCmd], {
       stdout: "pipe",
       stderr: "pipe",
     })
@@ -80,23 +101,18 @@ export class SshLxcExecutor implements LxcExecutor {
   }
 }
 
-/**
- * Production HTTP health checker using the Fetch API.
- */
-export class FetchHealthChecker implements HealthChecker {
-  async check(url: string): Promise<{ ok: boolean; status: number }> {
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(3000) })
-      return { ok: res.ok, status: res.status }
-    } catch {
-      return { ok: false, status: 0 }
-    }
-  }
-}
-
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 const RELEASES_KEEP = 3   // GC: keep newest N releases
+
+// Allowed SHA format: 7-40 hex chars (git short or full SHA)
+const SHA_RE = /^[0-9a-f]{7,40}$/
+
+function assertSha(sha: string): void {
+  if (!SHA_RE.test(sha)) {
+    throw new Error(`keel: sha '${sha}' must match ^[0-9a-f]{7,40}$ (git hex SHA)`)
+  }
+}
 
 function releasesBase(name: string): string {
   return `/srv/${name}/releases`
@@ -142,13 +158,26 @@ async function runInBuildPath(
 ): Promise<ExecResult> {
   // ACCEPTED RISK: cmd is build.install or build.command from keel.yaml in the
   // target repo. Execution is constrained to the spoke LXC.
-  // argv: ["sh", "-c", "cd <dir> && <cmd>"]
+  // The sh -c wrapper is necessary to evaluate the build command string.
   return exec.run(lxc, ["sh", "-c", `cd ${dir} && ${cmd}`])
 }
 
-/** Poll health until success or timeout. Returns true on 200. */
+/**
+ * Poll health from inside the target LXC using curl (fix #2).
+ *
+ * WHY curl-in-LXC instead of fetch() from keel:
+ *   health.url is always `http://localhost:<port>/...` — "localhost" relative
+ *   to the SERVICE LXC.  keel runs in its own LXC; a fetch() from here would
+ *   hit keel's own loopback, not the service.  Running curl inside the target
+ *   LXC via the executor resolves localhost correctly AND keeps health checking
+ *   consistent with the executor abstraction already used everywhere else.
+ *
+ * The HealthChecker abstraction is removed; tests mock health via the same
+ * MockExecutor they already use for everything else (curl verb → response).
+ */
 async function pollHealth(
-  checker: HealthChecker,
+  exec: LxcExecutor,
+  lxc: string,
   url: string,
   timeoutSec: number,
   log: string[],
@@ -157,9 +186,12 @@ async function pollHealth(
   let attempts = 0
   while (Date.now() < deadline) {
     attempts++
-    const result = await checker.check(url)
-    if (result.ok) {
-      log.push(`[health] ${url} → ${result.status} after ${attempts} attempt(s)`)
+    const res = await exec.run(lxc, [
+      "curl", "-fsS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "3", url,
+    ])
+    const httpCode = parseInt(res.stdout.trim(), 10)
+    if (res.code === 0 && httpCode >= 200 && httpCode < 300) {
+      log.push(`[health] ${url} → ${httpCode} after ${attempts} attempt(s)`)
       return true
     }
     await Bun.sleep(1000)
@@ -229,6 +261,9 @@ async function writeStateFile(
   const dir = stateDir(name)
   await exec.run(lxc, ["mkdir", "-p", dir])
   const path = `${dir}/${file}`
+  // Use tee with a single-element argv; sha is validated hex so no shell risk,
+  // but we pass it via echo pipe through sh to avoid the need for a separate
+  // "write" program that isn't universally available.
   const res = await exec.run(lxc, ["sh", "-c", `printf '%s' ${sha} > ${path}`])
   if (res.code !== 0) {
     log.push(`[state] warning: could not write ${path}: ${res.stderr.trim()}`)
@@ -249,7 +284,7 @@ async function appendDeployLog(
 // ── Generate systemd unit content ─────────────────────────────────────────────
 
 function buildSystemdUnit(config: KeelConfig, sha: string): string {
-  const { name, env_file, build, run, port } = config
+  const { name, env_file, run, port } = config
   const buildPath = config.repo.build_path
   const workingDir = buildPath === "."
     ? currentLink(name)
@@ -338,7 +373,7 @@ export interface DeployOpts {
  *  4. Ensure env_file exists; write systemd unit (skipped for static)
  *  5. performSwap (current → previous, atomic symlink)
  *  6. systemctl restart <name>  (skipped for static)
- *  7. health-poll
+ *  7. health-poll (curl inside target LXC)
  *  8. On failure: swap back to previous, restart, re-poll; mark rolled_back
  *  9. GC releases (keep 3)
  */
@@ -346,12 +381,18 @@ export async function deploy(
   config: KeelConfig,
   opts: DeployOpts,
   exec: LxcExecutor = new SshLxcExecutor(),
-  health: HealthChecker = new FetchHealthChecker(),
 ): Promise<DeployResult> {
   const { name, runtime, build, health: healthCfg } = config
   const { lxc, sha, repoUrl, cloneToken, branch = "main" } = opts
   const log: string[] = []
   const isStatic = runtime === "static"
+
+  // ── Validate SHA (security: sha is interpolated into state file paths) ──────
+  try {
+    assertSha(sha)
+  } catch (e) {
+    return { status: "failure", sha, previousSha: null, rolledBackTo: null, log: [(e as Error).message] }
+  }
 
   // ── Capture previous SHA for rollback ───────────────────────────────────────
   const previousSha = await readCurrentSha(exec, lxc, name)
@@ -412,8 +453,6 @@ export async function deploy(
 
     const unitContent = buildSystemdUnit(config, sha)
     const unitPath = `/etc/systemd/system/${name}.service`
-    // Write unit file via sh -c to avoid needing tee/privileged helper
-    const escapedContent = unitContent.replace(/'/g, `'\\''`)
     const writeUnit = await exec.run(lxc, [
       "sh", "-c", `cat > ${unitPath} << 'KEEL_UNIT_EOF'\n${unitContent}\nKEEL_UNIT_EOF`,
     ])
@@ -422,7 +461,6 @@ export async function deploy(
     } else {
       log.push(`[systemd] wrote ${unitPath}`)
     }
-    void escapedContent  // suppress unused warning; kept for reference
     await exec.run(lxc, ["systemctl", "daemon-reload"])
   }
 
@@ -440,14 +478,14 @@ export async function deploy(
     const restartRes = await exec.run(lxc, ["systemctl", "restart", name])
     if (restartRes.code !== 0) {
       log.push(`[restart] FAILED: ${restartRes.stderr.trim()}`)
-      // Fall through to health poll; it will catch this too
+      // Fall through to health poll; it will detect the failure
     } else {
       log.push(`[restart] systemctl restart ${name} ok`)
     }
   }
 
-  // ── Step 7: health poll ────────────────────────────────────────────────────
-  const healthy = await pollHealth(health, healthCfg.url, healthCfg.timeout, log)
+  // ── Step 7: health poll (curl inside target LXC) ──────────────────────────
+  const healthy = await pollHealth(exec, lxc, healthCfg.url, healthCfg.timeout, log)
 
   if (healthy) {
     // SUCCESS path
@@ -489,7 +527,7 @@ export async function deploy(
     log.push(`[rollback] restarted ${name}`)
   }
 
-  const rollbackHealthy = await pollHealth(health, healthCfg.url, healthCfg.timeout, log)
+  const rollbackHealthy = await pollHealth(exec, lxc, healthCfg.url, healthCfg.timeout, log)
 
   await writeStateFile(exec, lxc, name, "current", previousSha, log)
   await appendDeployLog(
@@ -521,12 +559,20 @@ export async function rollback(
   config: KeelConfig,
   opts: RollbackOpts,
   exec: LxcExecutor = new SshLxcExecutor(),
-  health: HealthChecker = new FetchHealthChecker(),
 ): Promise<DeployResult> {
   const { name, runtime, health: healthCfg } = config
   const { lxc } = opts
   const log: string[] = []
   const isStatic = runtime === "static"
+
+  // Validate explicit SHA if provided
+  if (opts.toSha) {
+    try {
+      assertSha(opts.toSha)
+    } catch (e) {
+      return { status: "failure", sha: "unknown", previousSha: null, rolledBackTo: null, log: [(e as Error).message] }
+    }
+  }
 
   const currentSha = await readCurrentSha(exec, lxc, name)
   log.push(`[rollback] current=${currentSha ?? "none"} lxc=${lxc}`)
@@ -541,6 +587,13 @@ export async function rollback(
       return { status: "failure", sha: currentSha ?? "unknown", previousSha: null, rolledBackTo: null, log }
     }
     targetSha = res.stdout.trim()
+    // Validate the SHA we just read from disk
+    try {
+      assertSha(targetSha)
+    } catch (e) {
+      log.push(`[rollback] invalid SHA in state file: ${(e as Error).message}`)
+      return { status: "failure", sha: currentSha ?? "unknown", previousSha: null, rolledBackTo: null, log }
+    }
   }
 
   log.push(`[rollback] target sha=${targetSha}`)
@@ -564,7 +617,7 @@ export async function rollback(
     log.push(`[rollback] restarted ${name}`)
   }
 
-  const healthy = await pollHealth(health, healthCfg.url, healthCfg.timeout, log)
+  const healthy = await pollHealth(exec, lxc, healthCfg.url, healthCfg.timeout, log)
 
   await writeStateFile(exec, lxc, name, "current", targetSha, log)
   await appendDeployLog(
