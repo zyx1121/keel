@@ -26,12 +26,13 @@ fi
 # Make bun available for the rest of this script (installer puts it in ~/.bun/bin)
 export PATH="${HOME}/.bun/bin:${PATH}"
 
-# ── 3. PostgreSQL — database + role ───────────────────────────────────────────
+# ── 3. PostgreSQL — database + role + local trust auth ─────────────────────────
 
 systemctl enable postgresql
 systemctl start postgresql
 
-# Create DB and role idempotently
+# Role (idempotent). No password — keel_app authenticates via localhost trust;
+# this LXC is single-tenant + spoke-isolated. TODO(security): scram if shared.
 sudo -u postgres psql -v ON_ERROR_STOP=1 <<'SQL'
 DO $$
 BEGIN
@@ -39,11 +40,19 @@ BEGIN
     CREATE ROLE keel_app LOGIN;
   END IF;
 END$$;
-
-CREATE DATABASE keel OWNER keel_app;
 SQL
-# If the DB already exists psql exits non-zero; suppress that specific error.
-sudo -u postgres psql -v ON_ERROR_STOP=0 -c "CREATE DATABASE keel OWNER keel_app;" 2>/dev/null || true
+
+# Database (idempotent — CREATE DATABASE can't sit inside a DO block).
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='keel'" | grep -q 1; then
+  sudo -u postgres createdb -O keel_app keel
+fi
+
+# pg_hba: trust keel_app → keel over loopback (idempotent append + reload).
+PGHBA=$(sudo -u postgres psql -tAc "SHOW hba_file" | tr -d '[:space:]')
+if ! grep -qE '^host[[:space:]]+keel[[:space:]]+keel_app' "$PGHBA"; then
+  echo "host    keel    keel_app    127.0.0.1/32    trust" >> "$PGHBA"
+  systemctl reload postgresql
+fi
 
 # ── 4. Clone / update repo ────────────────────────────────────────────────────
 
@@ -86,7 +95,10 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON keel.routes          TO keel_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON keel.deployments     TO keel_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON keel.secret_keys     TO keel_app;
 GRANT INSERT                         ON keel.audit_log        TO keel_app;
--- audit_log: intentionally NO UPDATE or DELETE for keel_app
+-- Enforce append-only: reassign audit_log to postgres so keel_app (non-owner)
+-- cannot UPDATE/DELETE it. Table owners always bypass GRANTs, so an INSERT-only
+-- grant is only real when keel_app is NOT the owner.
+ALTER TABLE keel.audit_log OWNER TO postgres;
 ALTER DEFAULT PRIVILEGES IN SCHEMA keel GRANT USAGE ON SEQUENCES TO keel_app;
 SQL
 
