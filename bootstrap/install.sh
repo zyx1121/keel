@@ -15,7 +15,7 @@ SERVICE_NAME="keel"
 # ── 1. System packages ─────────────────────────────────────────────────────────
 
 apt-get update -qq
-apt-get install -y -qq git curl postgresql postgresql-contrib
+apt-get install -y -qq git curl unzip postgresql postgresql-contrib
 
 # ── 2. Bun (official installer, idempotent) ────────────────────────────────────
 
@@ -26,32 +26,33 @@ fi
 # Make bun available for the rest of this script (installer puts it in ~/.bun/bin)
 export PATH="${HOME}/.bun/bin:${PATH}"
 
-# ── 3. PostgreSQL — database + role + local trust auth ─────────────────────────
+# ── 3. PostgreSQL — database + role (scram password on loopback) ───────────────
 
 systemctl enable postgresql
 systemctl start postgresql
 
-# Role (idempotent). No password — keel_app authenticates via localhost trust;
-# this LXC is single-tenant + spoke-isolated. TODO(security): scram if shared.
-sudo -u postgres psql -v ON_ERROR_STOP=1 <<'SQL'
-DO $$
+# Source env early: KEEL_DB_PASSWORD + DATABASE_URL drive role + migration.
+if [ -f "${ENV_DIR}/keel.env" ]; then
+  set -a; source "${ENV_DIR}/keel.env"; set +a
+fi
+: "${KEEL_DB_PASSWORD:?set KEEL_DB_PASSWORD in ${ENV_DIR}/keel.env before running}"
+
+# Role (idempotent) with password — authenticates via scram on the default
+# loopback pg_hba rule (no pg_hba edit needed). Password is hex (no SQL metachars).
+sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL
+DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'keel_app') THEN
-    CREATE ROLE keel_app LOGIN;
+    CREATE ROLE keel_app LOGIN PASSWORD '${KEEL_DB_PASSWORD}';
+  ELSE
+    ALTER ROLE keel_app PASSWORD '${KEEL_DB_PASSWORD}';
   END IF;
-END$$;
+END\$\$;
 SQL
 
 # Database (idempotent — CREATE DATABASE can't sit inside a DO block).
 if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='keel'" | grep -q 1; then
   sudo -u postgres createdb -O keel_app keel
-fi
-
-# pg_hba: trust keel_app → keel over loopback (idempotent append + reload).
-PGHBA=$(sudo -u postgres psql -tAc "SHOW hba_file" | tr -d '[:space:]')
-if ! grep -qE '^host[[:space:]]+keel[[:space:]]+keel_app' "$PGHBA"; then
-  echo "host    keel    keel_app    127.0.0.1/32    trust" >> "$PGHBA"
-  systemctl reload postgresql
 fi
 
 # ── 4. Clone / update repo ────────────────────────────────────────────────────
@@ -94,11 +95,14 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON keel.repo_bindings   TO keel_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON keel.routes          TO keel_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON keel.deployments     TO keel_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON keel.secret_keys     TO keel_app;
-GRANT INSERT                         ON keel.audit_log        TO keel_app;
--- Enforce append-only: reassign audit_log to postgres so keel_app (non-owner)
--- cannot UPDATE/DELETE it. Table owners always bypass GRANTs, so an INSERT-only
--- grant is only real when keel_app is NOT the owner.
+-- Enforce append-only: reassign audit_log to postgres FIRST, THEN grant INSERT.
+-- Order matters: a GRANT to a table's own owner is a no-op (owner privileges are
+-- implicit, no ACL entry), so granting while keel_app still owned audit_log left
+-- it with nothing after the owner change. Reassign, then grant on the now-foreign
+-- table. id is a sequence default (not identity), so INSERT also needs sequence USAGE.
 ALTER TABLE keel.audit_log OWNER TO postgres;
+GRANT INSERT ON keel.audit_log TO keel_app;
+GRANT USAGE ON SEQUENCE keel.audit_log_id_seq TO keel_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA keel GRANT USAGE ON SEQUENCES TO keel_app;
 SQL
 
