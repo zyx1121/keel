@@ -1,29 +1,27 @@
-import { describe, it, expect, beforeAll, afterAll } from "bun:test"
+import { describe, it, expect, beforeAll } from "bun:test"
 
-// Tests for bearer auth logic. We import the raw tokenEqual logic via checkAuth
-// by constructing mock Requests — this exercises the real code path.
+// Tests for bearer auth logic. We exercise checkAuth via mock Requests.
 //
-// NOTE: config.ts calls process.exit(1) if MCP_WRITE_TOKEN is unset/short.
-// We set a valid token before importing any module that pulls in config.
-
-const TEST_TOKEN = "test-token-valid-16c"
+// config.ts reads MCP_WRITE_TOKEN at module evaluation time. In CI the workflow
+// sets the env var; locally we ensure it here. We read the actual token from
+// config so the tests always use the same value config was loaded with.
 
 beforeAll(() => {
-  process.env["MCP_WRITE_TOKEN"] = TEST_TOKEN
-  process.env["DATABASE_URL"] = "postgres://localhost/keel_test"
-})
-
-afterAll(() => {
-  delete process.env["MCP_WRITE_TOKEN"]
-  delete process.env["DATABASE_URL"]
+  if (!process.env["MCP_WRITE_TOKEN"]) {
+    process.env["MCP_WRITE_TOKEN"] = "test-token-valid-16c"
+  }
+  if (!process.env["DATABASE_URL"]) {
+    process.env["DATABASE_URL"] = "postgres://localhost/keel_test"
+  }
 })
 
 describe("checkAuth", () => {
   it("accepts a valid bearer token", async () => {
     const { checkAuth } = await import("../auth.ts")
+    const { config } = await import("../config.ts")
     const req = new Request("http://localhost/mcp", {
       method: "POST",
-      headers: { Authorization: `Bearer ${TEST_TOKEN}` },
+      headers: { Authorization: `Bearer ${config.mcpWriteToken}` },
     })
     const result = checkAuth(req)
     expect(result).toBeNull()
@@ -33,7 +31,7 @@ describe("checkAuth", () => {
     const { checkAuth } = await import("../auth.ts")
     const req = new Request("http://localhost/mcp", {
       method: "POST",
-      headers: { Authorization: "Bearer wrong-token-here" },
+      headers: { Authorization: "Bearer definitely-wrong-token-xyz" },
     })
     const result = checkAuth(req)
     expect(result).not.toBeNull()

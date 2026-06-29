@@ -1,19 +1,31 @@
 import { describe, it, expect, beforeAll } from "bun:test"
 
-const TEST_TOKEN = "test-token-valid-16c"
+// config.ts reads MCP_WRITE_TOKEN at module evaluation time.
+// We read the token back from config after it's loaded to avoid token mismatch
+// when CI env and local test env differ.
 
 beforeAll(() => {
-  process.env["MCP_WRITE_TOKEN"] = TEST_TOKEN
-  process.env["DATABASE_URL"] = "postgres://localhost/keel_test"
+  if (!process.env["MCP_WRITE_TOKEN"]) {
+    process.env["MCP_WRITE_TOKEN"] = "test-token-valid-16c"
+  }
+  if (!process.env["DATABASE_URL"]) {
+    process.env["DATABASE_URL"] = "postgres://localhost/keel_test"
+  }
 })
+
+async function getToken(): Promise<string> {
+  const { config } = await import("../config.ts")
+  return config.mcpWriteToken
+}
 
 describe("mcp-dispatch", () => {
   it("initialize returns serverInfo with name=keel", async () => {
     const { handleMcp } = await import("../mcp-dispatch.ts")
+    const token = await getToken()
     const req = new Request("http://localhost/mcp", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${TEST_TOKEN}`,
+        Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
@@ -26,10 +38,11 @@ describe("mcp-dispatch", () => {
 
   it("tools/list returns empty array (stub)", async () => {
     const { handleMcp } = await import("../mcp-dispatch.ts")
+    const token = await getToken()
     const req = new Request("http://localhost/mcp", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${TEST_TOKEN}`,
+        Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
@@ -54,10 +67,11 @@ describe("mcp-dispatch", () => {
 
   it("notifications/initialized returns 204 no content", async () => {
     const { handleMcp } = await import("../mcp-dispatch.ts")
+    const token = await getToken()
     const req = new Request("http://localhost/mcp", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${TEST_TOKEN}`,
+        Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
@@ -68,10 +82,11 @@ describe("mcp-dispatch", () => {
 
   it("unknown method returns -32601 method not found", async () => {
     const { handleMcp } = await import("../mcp-dispatch.ts")
+    const token = await getToken()
     const req = new Request("http://localhost/mcp", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${TEST_TOKEN}`,
+        Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ jsonrpc: "2.0", id: 4, method: "nope/nope" }),
