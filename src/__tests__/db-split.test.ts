@@ -27,3 +27,19 @@ test("DO block with multiple internal semicolons stays one statement", () => {
 test("ignores trailing whitespace-only fragments", () => {
   expect(splitSqlStatements("SELECT 1;   ;  ").length).toBe(1)
 })
+
+// Regression for the actual bug: a stray $$ in a -- comment desynced the toggle
+// and shredded the DO block it described.
+test("a $$ inside a -- comment does not desync the toggle", () => {
+  const sql = `-- idempotent via DO $$
+DO $$ BEGIN ALTER TABLE a ADD COLUMN x text; END $$;
+SELECT 2;`
+  const stmts = splitSqlStatements(sql)
+  expect(stmts.length).toBe(2)
+  expect(stmts[0]).toContain("ADD COLUMN x text")
+  expect(stmts[0]).toContain("END $$")
+})
+
+test("a ; inside a -- comment does not split", () => {
+  expect(splitSqlStatements("SELECT 1; -- a ; b ; c\nSELECT 2;").length).toBe(2)
+})
