@@ -81,6 +81,15 @@ async function handleProvisionCt(args: Record<string, unknown>): Promise<unknown
 
   try {
     const ct = await pveCreateCt(name, opts, getMcpPveExecutor())
+    // Register the provisioned LXC as a service row so bind_service/deploy can find
+    // it (they look up by name). port is a placeholder (0) until bind_service sets
+    // it from keel.yaml. ON CONFLICT keeps provision idempotent.
+    const sql = getSql()
+    await sql`
+      INSERT INTO keel.services (name, vmid, ip, port, status)
+      VALUES (${name}, ${ct.vmid}, ${ct.ip}, 0, 'provisioned')
+      ON CONFLICT (name) DO UPDATE SET vmid = EXCLUDED.vmid, ip = EXCLUDED.ip, updated_at = now()
+    `
     await auditLog(null, "provision_ct", { name, vmid: ct.vmid, ip: ct.ip })
     return { ok: true, vmid: ct.vmid, ip: ct.ip, name: ct.name, status: ct.status }
   } catch (e) {
