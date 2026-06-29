@@ -117,15 +117,20 @@ export function setPveExecutor(exec: PveExecutor): void {
 
 export interface CtInfo {
   vmid: number
-  ip: string
-  hostname: string
-  status: string
+  name: string       // container hostname / name field
+  status?: string
+  ip?: string        // absent in list output; parsed from net0 in status output
 }
 
-export interface ForwardEntry {
-  hostPort: number
-  ip: string
-  vmPort: number
+/**
+ * Parse the ip= field out of a Proxmox net0 string.
+ *
+ * Real status data shape: net0 = "name=eth0,bridge=vmbr0,ip=10.10.10.201/24,..."
+ * Returns the bare IP without the prefix length, or undefined if not found.
+ */
+export function parseIpFromNet0(net0: string): string | undefined {
+  const m = net0.match(/ip=([\d.]+)\//)
+  return m?.[1]
 }
 
 // ── Fixed function set (allowlist) ─────────────────────────────────────────────
@@ -162,6 +167,8 @@ export async function createCt(
   if (opts.swap !== undefined) argv.push("--swap", String(opts.swap))
   argv.push("-y")
   const result = await exec.run(argv)
+  // create-ct data: {vmid, name, ip, type, cores, ram_mb, ...}
+  // ip is present at top level — no net0 parsing needed here.
   return parseEnvelope<CtInfo>(result, "create-ct")
 }
 
@@ -211,17 +218,19 @@ export async function removeDns(
 /**
  * Add a Caddy reverse-proxy route.
  *
- * Maps to: utils pve caddy <domain> <upstream> [--tls ..] [--path ..] --action add -y
+ * Maps to: utils pve caddy <domain> <upstream> [--tls TEXT] --action add -y
+ *
+ * NOTE: --path is NOT supported by the CLI.
+ * TODO(V3): implement path routing via --body when migrating mcp/pad.
  */
 export async function addCaddy(
   domain: string,
   upstream: string,
-  opts: { tls?: string; path?: string } = {},
+  opts: { tls?: string } = {},
   exec: PveExecutor = getPveExecutor(),
 ): Promise<void> {
   const argv: string[] = ["caddy", domain, upstream]
   if (opts.tls) argv.push("--tls", opts.tls)
-  if (opts.path) argv.push("--path", opts.path)
   argv.push("--action", "add", "-y")
   const result = await exec.run(argv)
   parseEnvelope(result, "caddy add")
@@ -244,7 +253,8 @@ export async function removeCaddy(
 /**
  * Add a port-forward DNAT rule: <hostPort> → <ip>:<vmPort>.
  *
- * Maps to: utils pve forward --host-port <n> --ip <ip> --vm-port <n> --action add -y
+ * Maps to: utils pve forward <HOST_PORT:VM_IP:VM_PORT> --action add
+ * SPEC is a positional argument; no --host-port/--ip/--vm-port flags; no -y.
  */
 export async function addForward(
   hostPort: number,
@@ -252,13 +262,8 @@ export async function addForward(
   vmPort: number,
   exec: PveExecutor = getPveExecutor(),
 ): Promise<void> {
-  const argv = [
-    "forward",
-    "--host-port", String(hostPort),
-    "--ip", ip,
-    "--vm-port", String(vmPort),
-    "--action", "add", "-y",
-  ]
+  const spec = `${hostPort}:${ip}:${vmPort}`
+  const argv = ["forward", spec, "--action", "add"]
   const result = await exec.run(argv)
   parseEnvelope(result, "forward add")
 }
@@ -267,19 +272,36 @@ export async function addForward(
  * List all active port-forward rules.
  *
  * Maps to: utils pve forward --action list
+ * Returns raw iptables rule lines from data.rules (not structured objects).
  */
 export async function listForward(
   exec: PveExecutor = getPveExecutor(),
-): Promise<ForwardEntry[]> {
+): Promise<string[]> {
   const argv = ["forward", "--action", "list"]
   const result = await exec.run(argv)
-  return parseEnvelope<ForwardEntry[]>(result, "forward list")
+  const data = parseEnvelope<{ rules: string[] }>(result, "forward list")
+  return data.rules
+}
+
+// Raw shape returned by `utils pve status` before ip extraction.
+interface StatusRaw {
+  vmid: number
+  name: string
+  type?: string
+  status?: string
+  cores?: number
+  hostname?: string
+  memory?: unknown
+  net0?: string       // "name=eth0,bridge=vmbr0,ip=10.10.10.201/24,..."
+  onboot?: boolean
+  rootfs?: string
 }
 
 /**
  * Get status of a container by name or VMID.
  *
  * Maps to: utils pve status <nameOrVmid>
+ * Real data shape has ip embedded in net0 string — extracted via parseIpFromNet0.
  */
 export async function status(
   nameOrVmid: string | number,
@@ -287,18 +309,22 @@ export async function status(
 ): Promise<CtInfo> {
   const argv = ["status", String(nameOrVmid)]
   const result = await exec.run(argv)
-  return parseEnvelope<CtInfo>(result, "status")
+  const raw = parseEnvelope<StatusRaw>(result, "status")
+  const ip = raw.net0 ? parseIpFromNet0(raw.net0) : undefined
+  return { vmid: raw.vmid, name: raw.name, status: raw.status, ip }
 }
 
 /**
  * List all containers managed by keel (2xx range).
  *
  * Maps to: utils pve list
+ * data shape: [{vmid, name, status, mem_mb?, type}] — no ip field.
  */
 export async function list(
   exec: PveExecutor = getPveExecutor(),
 ): Promise<CtInfo[]> {
   const argv = ["list"]
   const result = await exec.run(argv)
+  // ip is absent from list output — callers that need ip must call status().
   return parseEnvelope<CtInfo[]>(result, "list")
 }
