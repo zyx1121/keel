@@ -1,6 +1,50 @@
-image: ghcr.io/owner/app
-service: app            # systemd unit name OR docker compose service name
-health_url: http://localhost:8080/health
-health_timeout: 30      # seconds to wait for health_url to return 200
-env_file: /etc/keel/app.env   # host-side env file; never in the repo
-runtime: compose        # compose | systemd-container
+# keel.yaml — LXC-as-service deployment descriptor (V1.3)
+# Place this file at the root of your service repo.
+# keel reads it on every deploy to know how to build and run your service.
+
+name: pad-core              # service name = LXC hostname = systemd unit
+runtime: bun                # bun | node | python | static
+
+repo:
+  build_path: apps/mcp      # subdirectory for monorepos; omit for repo root
+
+build:
+  # runtime defaults (shown for bun — omit if you use the defaults):
+  install: bun install --frozen-lockfile
+  command: bun run build
+
+run:
+  command: bun run start
+  working_dir: /opt/pad-core
+  # OR: systemd_unit: /etc/systemd/system/pad-core.service
+
+port: 8080
+
+health:
+  url: http://localhost:8080/healthz
+  timeout: 30               # seconds
+
+env_file: /etc/keel/pad-core.env   # managed outside the repo (sops/scp)
+
+resources:
+  cores: 2
+  ram: 512                  # MiB
+  disk: 16                  # GiB
+  swap: 4096                # MiB (Bun/node benefit from this on small VMs)
+
+expose:
+  internal: pad-core.internal          # dnsmasq → LXC direct (10.10.10.2xx)
+  public: pad-core.app.zyx.tw          # Caddy TLS → reverse_proxy
+  public_path: /mcp                    # optional path prefix on public host
+
+depends_on:
+  - pad-db                  # keel ensures pad-db is healthy before deploying this
+
+# ── Runtime defaults (applied when fields are omitted) ────────────────────────
+#
+#  runtime │ build.install               │ build.command   │ run.command
+#  --------│-----------------------------│-----------------│-----------------
+#  bun     │ bun install --frozen-lockfile│ bun run build   │ bun run start
+#  node    │ npm ci                      │ npm run build   │ node .
+#  python  │ uv sync                     │ (none)          │ (must specify)
+#  static  │ (none)                      │ bun run build   │ (none, Caddy file_server)
