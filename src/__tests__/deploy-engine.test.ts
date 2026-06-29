@@ -30,14 +30,16 @@ function curlFail(): ExecResult { return { code: 1, stdout: "000", stderr: "conn
 /**
  * Programmable mock executor.
  * - `responses` maps argv[0] (the command verb) to a result factory.
+ * - For "sh" commands, the factory also receives argv[2] (the shell script string)
+ *   so tests can distinguish ensureRuntime checks from build steps.
  * - Anything not in the map returns ok().
  * - Use `calls` to inspect what was executed.
  */
 class MockExecutor implements LxcExecutor {
   calls: Array<{ lxc: string; argv: string[] }> = []
-  private responses: Map<string, ExecResult | (() => ExecResult)>
+  private responses: Map<string, ExecResult | ((argv: string[]) => ExecResult)>
 
-  constructor(responses: Record<string, ExecResult | (() => ExecResult)> = {}) {
+  constructor(responses: Record<string, ExecResult | ((argv: string[]) => ExecResult)> = {}) {
     this.responses = new Map(Object.entries(responses))
   }
 
@@ -46,7 +48,7 @@ class MockExecutor implements LxcExecutor {
     const verb = argv[0] ?? ""
     const entry = this.responses.get(verb)
     if (entry === undefined) return ok()
-    return typeof entry === "function" ? entry() : entry
+    return typeof entry === "function" ? entry(argv) : entry
   }
 
   /** Return all argv arrays where argv[0] === verb. */
@@ -60,7 +62,7 @@ class MockExecutor implements LxcExecutor {
  * Each call to the returned factory pops the next response.
  * After exhaustion the last response repeats (so [curlFail] = always fail).
  */
-function curlSequence(...results: ExecResult[]): () => ExecResult {
+function curlSequence(...results: ExecResult[]): (_argv: string[]) => ExecResult {
   let idx = 0
   return () => {
     const r = results[Math.min(idx, results.length - 1)] ?? curlFail()
@@ -213,11 +215,24 @@ describe("deploy — happy path", () => {
 
 // ── Test 2: Build failure ─────────────────────────────────────────────────────
 
+// Helper: sh factory that passes ensureRuntime checks (which/dpkg) but fails
+// on actual build commands (cd <releasedir> && ...).
+// WHY: ensureRuntime calls `sh -c "which <bin> && echo installed"` and
+//      `sh -c "dpkg ..."`. Build steps call `sh -c "cd <path> && <cmd>"`.
+//      We need to let ensureRuntime succeed so the test exercises build failure.
+function shPassRuntimeFailBuild(errorMsg: string) {
+  return (argv: string[]) => {
+    const script = argv[2] ?? ""
+    if (script.includes("which") || script.includes("dpkg")) return ok("installed")
+    return fail(errorMsg)
+  }
+}
+
 describe("deploy — build failure", () => {
   it("returns status=failure, current symlink is not changed", async () => {
     const exec = new MockExecutor({
       readlink: ok("/srv/danmu/releases/prevsha"),
-      sh: fail("build exploded"),
+      sh: shPassRuntimeFailBuild("build exploded"),
     })
 
     const result = await deploy(makeConfig(), DEFAULT_OPTS, exec)
@@ -231,7 +246,7 @@ describe("deploy — build failure", () => {
   it("cleans up the release dir on build failure", async () => {
     const exec = new MockExecutor({
       readlink: ok(""),
-      sh: fail("install error"),
+      sh: shPassRuntimeFailBuild("install error"),
     })
 
     await deploy(makeConfig(), DEFAULT_OPTS, exec)
@@ -242,7 +257,7 @@ describe("deploy — build failure", () => {
 
   it("logs build failure message", async () => {
     const exec = new MockExecutor({
-      sh: fail("tsc: error TS2345"),
+      sh: shPassRuntimeFailBuild("tsc: error TS2345"),
     })
 
     const result = await deploy(makeConfig(), DEFAULT_OPTS, exec)

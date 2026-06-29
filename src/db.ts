@@ -58,11 +58,14 @@ CREATE TABLE IF NOT EXISTS keel.services (
 
 -- repo_bindings: GitHub repo → service mapping
 CREATE TABLE IF NOT EXISTS keel.repo_bindings (
-  id           serial PRIMARY KEY,
-  service_id   integer NOT NULL REFERENCES keel.services(id),
-  repo_full    text NOT NULL UNIQUE,  -- e.g. "zyx1121/danmu"
-  default_branch text NOT NULL DEFAULT 'main',
-  created_at   timestamptz NOT NULL DEFAULT now()
+  id              serial PRIMARY KEY,
+  service_id      integer NOT NULL REFERENCES keel.services(id),
+  repo_full       text NOT NULL UNIQUE,  -- e.g. "zyx1121/danmu"
+  default_branch  text NOT NULL DEFAULT 'main',
+  -- V2 additions (ALTER TABLE below handles existing tables)
+  keel_yaml       text,                  -- stored keel.yaml for webhook auto-deploy
+  installation_id bigint,                -- GitHub App installation id
+  created_at      timestamptz NOT NULL DEFAULT now()
 );
 
 -- routes: external hostname → service routing (Caddy/dnsmasq)
@@ -116,6 +119,24 @@ CREATE INDEX IF NOT EXISTS deployments_service_idx ON keel.deployments (service_
 CREATE INDEX IF NOT EXISTS deployments_status_idx  ON keel.deployments (status);
 CREATE INDEX IF NOT EXISTS audit_log_service_idx   ON keel.audit_log (service_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS audit_log_action_idx    ON keel.audit_log (action);
+
+-- V2 migrations: add columns to existing tables (idempotent via DO $$)
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+    WHERE table_schema='keel' AND table_name='repo_bindings' AND column_name='keel_yaml') THEN
+    ALTER TABLE keel.repo_bindings ADD COLUMN keel_yaml text;
+  END IF;
+END $$;
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+    WHERE table_schema='keel' AND table_name='repo_bindings' AND column_name='installation_id') THEN
+    ALTER TABLE keel.repo_bindings ADD COLUMN installation_id bigint;
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS repo_bindings_repo_branch_idx
+  ON keel.repo_bindings (repo_full, default_branch);
 `
 
 export async function runMigration() {
