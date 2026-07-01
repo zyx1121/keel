@@ -213,6 +213,27 @@ describe("deploy — happy path", () => {
   })
 })
 
+describe("deploy — systemd unit capability grant", () => {
+  function writtenUnitContent(exec: MockExecutor): string {
+    const shCalls = exec.callsFor("sh").map((a) => a.join(" "))
+    const unitCall = shCalls.find((c) => c.includes("cat >") && c.includes(".service"))
+    expect(unitCall).toBeDefined()
+    return unitCall!
+  }
+
+  it("adds AmbientCapabilities=CAP_NET_BIND_SERVICE when port < 1024", async () => {
+    const exec = new MockExecutor({ readlink: ok(""), curl: curlOk() })
+    await deploy(makeConfig({ port: 80 }), DEFAULT_OPTS, exec)
+    expect(writtenUnitContent(exec)).toContain("AmbientCapabilities=CAP_NET_BIND_SERVICE")
+  })
+
+  it("omits AmbientCapabilities for unprivileged ports", async () => {
+    const exec = new MockExecutor({ readlink: ok(""), curl: curlOk() })
+    await deploy(makeConfig({ port: 3000 }), DEFAULT_OPTS, exec)
+    expect(writtenUnitContent(exec)).not.toContain("AmbientCapabilities")
+  })
+})
+
 // ── Test 2: Build failure ─────────────────────────────────────────────────────
 
 // Helper: sh factory that passes ensureRuntime checks (which/dpkg) but fails
