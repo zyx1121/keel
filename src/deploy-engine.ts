@@ -389,7 +389,7 @@ function buildSystemdUnit(config: KeelConfig, sha: string): string {
 
   // WHY: EnvironmentFile keeps secrets off the process cmdline; /etc/keel/<name>.env
   //      is 600 root-owned on the LXC, managed by sops/scp (V2).
-  return [
+  const lines = [
     `[Unit]`,
     `Description=keel managed service: ${name} (${sha})`,
     `After=network.target`,
@@ -403,10 +403,17 @@ function buildSystemdUnit(config: KeelConfig, sha: string): string {
     `RestartSec=5`,
     // Expose PORT so the app can bind the right port without hardcoding
     `Environment=PORT=${port}`,
-    ``,
-    `[Install]`,
-    `WantedBy=multi-user.target`,
-  ].join("\n")
+  ]
+
+  // WHY: ports <1024 need CAP_NET_BIND_SERVICE — unprivileged LXC users can't
+  //      bind them otherwise. Ambient cap avoids running the whole unit as root.
+  if (port < 1024) {
+    lines.push(`AmbientCapabilities=CAP_NET_BIND_SERVICE`)
+  }
+
+  lines.push(``, `[Install]`, `WantedBy=multi-user.target`)
+
+  return lines.join("\n")
 }
 
 // ── Core: performSwap ─────────────────────────────────────────────────────────
