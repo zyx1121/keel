@@ -770,7 +770,10 @@ export const TOOLS: ToolDef[] = [
     inputSchema: {
       type: "object",
       properties: {
-        name: { type: "string", description: "Service name (hostname-safe: [a-z0-9][a-z0-9-]{0,62})" },
+        name: {
+          type: "string",
+          description: "Service name (hostname-safe: ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$)",
+        },
         cores: { type: "number", description: "CPU cores (default: 1)" },
         ram: { type: "number", description: "RAM in MiB (default: 256)" },
         disk: { type: "number", description: "Disk in GiB (default: 8)" },

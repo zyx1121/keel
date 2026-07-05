@@ -173,6 +173,40 @@ describe("parseKeelConfig — validation errors", () => {
     ).toThrow("name")
   })
 
+  // Regression: a trailing hyphen produces an invalid RFC 1123 DNS label
+  // (must start AND end with alphanumeric) — used to pass the old
+  // `^[a-z0-9][a-z0-9-]{0,62}$` regex and break downstream hostname/systemd
+  // unit usage.
+  it("throws on name ending with a hyphen", () => {
+    expect(() =>
+      parseKeelConfig(`name: foo-\nruntime: bun\nport: 8080\nexpose:\n  internal: x.internal`),
+    ).toThrow("name")
+  })
+
+  it("accepts a single-character name", () => {
+    const cfg = parseKeelConfig(
+      `name: a\nruntime: bun\nport: 8080\nexpose:\n  internal: x.internal`,
+    )
+    expect(cfg.name).toBe("a")
+  })
+
+  it("accepts name at the 63-char boundary", () => {
+    const boundaryName = "a".repeat(63)
+    const cfg = parseKeelConfig(
+      `name: ${boundaryName}\nruntime: bun\nport: 8080\nexpose:\n  internal: x.internal`,
+    )
+    expect(cfg.name).toBe(boundaryName)
+  })
+
+  it("throws on a 63-char name ending with a hyphen (boundary + trailing dash)", () => {
+    const boundaryBadName = "a".repeat(62) + "-"
+    expect(() =>
+      parseKeelConfig(
+        `name: ${boundaryBadName}\nruntime: bun\nport: 8080\nexpose:\n  internal: x.internal`,
+      ),
+    ).toThrow("name")
+  })
+
   it("throws on missing port", () => {
     expect(() =>
       parseKeelConfig(`name: svc\nruntime: bun\nexpose:\n  internal: x.internal`),
