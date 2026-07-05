@@ -147,14 +147,15 @@ function assertString(value: unknown, field: string): string {
 // WHY: name is used as a hostname, systemd unit name, path component, and
 // subdomain — all of which require hostname-safe identifiers.  Allowing shell
 // metacharacters here would let a repo-controlled keel.yaml inject commands
-// via the sh -c interpolations in deploy-engine.ts.
-const NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/
+// via the sh -c interpolations in deploy-engine.ts.  Must start AND end with
+// alphanumeric — a trailing `-` produces an invalid RFC 1123 DNS label.
+const NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/
 
 function assertName(value: unknown): string {
   const s = assertString(value, "name")
   if (!NAME_RE.test(s)) {
     throw new Error(
-      `keel.yaml: field 'name' must match ^[a-z0-9][a-z0-9-]{0,62}$ (hostname-safe identifier)`,
+      `keel.yaml: field 'name' must match ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ (hostname-safe identifier)`,
     )
   }
   return s
