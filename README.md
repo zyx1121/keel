@@ -1,32 +1,33 @@
+```
+██╗  ██╗███████╗███████╗██╗
+██║ ██╔╝██╔════╝██╔════╝██║
+█████╔╝ █████╗  █████╗  ██║
+██╔═██╗ ██╔══╝  ██╔══╝  ██║
+██║  ██╗███████╗███████╗███████╗
+╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝
+```
+
 # keel
 
-git-driven CD orchestrator for LXC-as-service on Proxmox. MCP-driven, Vercel-like.
+> Push to main. keel provisions the LXC, builds it, wires DNS and Caddy, and tells GitHub how it went. No Docker, no k8s, no clicking around Proxmox.
 
-Agent pushes a repo → keel provisions an LXC, builds inside it, wires DNS + Caddy, and reports deployment status back to GitHub. No Docker. No k8s.
+`proxmox` · `lxc` · `mcp` · `git-driven-cd` · `bun`
 
-## Architecture
+[![CI](https://github.com/zyx1121/keel/actions/workflows/ci.yml/badge.svg)](https://github.com/zyx1121/keel/actions) &nbsp;[![version](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fzyx1121%2Fkeel%2Fmain%2Fpackage.json&query=%24.version&label=version&color=111111)](package.json) &nbsp;[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](#license)
 
 ```
-agent --MCP(bearer)--> keel /mcp
-GitHub --webhook(HMAC)--> keel /webhook  (V2)
-   │
-   ▼  push → repo↔service binding → deploy queue
-keel LXC (2xx)
-   │  ssh(forced-command) → utils pve {create-ct,dns,caddy,forward,destroy,status}
-   │  ssh(target LXC)     → git pull + build → symlink swap → systemctl restart
-   ▼
-GitHub Deployments API ← queued/in_progress/success/failure
+$ git push origin main
+  → GitHub webhook (HMAC) → keel /webhook
+  ⚡ deploy { name: "danmu", sha: "f8a3c1e" }
+✓ clone → build → symlink swap → health OK (9s)
+✓ GitHub Deployment: success
 ```
 
-## Stack
+<sub>Push, and keel deploys danmu.internal + danmu.app.zyx.tw the Vercel way, on a Proxmox box you already own.</sub>
 
-- **Runtime**: [Bun](https://bun.sh) + TypeScript, ES modules
-- **Transport**: hand-rolled JSON-RPC 2.0 over `Bun.serve` (no SDK — incompatible transport)
-- **Auth**: bearer token, `timingSafeEqual` over sha256, fail-closed
-- **State**: Postgres (`keel` schema — desired state; live PVE/LXC = runtime truth)
-- **Deploy target**: LXC (unprivileged + no-nesting), Capistrano-style releases
+Every new service used to mean the same manual crawl: spin up an LXC by hand, wire dnsmasq and Caddy, ssh in for a `git pull` and a restart. keel folds that into one push (or one MCP tool call), the same shape as Vercel but landing on LXCs instead of someone else's cloud.
 
-## Quick start (dev)
+## Quickstart (dev)
 
 ```sh
 export MCP_WRITE_TOKEN=<token-min-16-chars>
@@ -37,54 +38,88 @@ bun run dev
 ```
 
 ```sh
-# Health
 curl http://localhost:8080/healthz
-
-# MCP initialize
-curl -X POST http://localhost:8080/mcp \
-  -H "Authorization: Bearer $MCP_WRITE_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+# {"status":"ok","db":true,"webhook":"unconfigured"}
 ```
 
-## MCP tools
+## What it gives you
 
-Tools are a stub in V1.2 (`tools/list` returns `[]`). V1.5 will add:
+- **Provisions and wires networking on demand**: `provision_ct` plus `bind_service` / `bind_repo` spin up an LXC and register DNS + Caddy + webhook auto-deploy in one call.
+- **Deploys Capistrano-style**: git SHA → clone → build → symlink swap → health poll, with auto-rollback on failure and a GitHub Deployment status update on every push.
+- **Tears down safely**: `destroy_service` requires `confirm: true` and cascades Caddy, DNS, DB rows, and the LXC together.
+
+## Architecture
+
+```
+agent --MCP(bearer)--> keel /mcp
+GitHub --webhook(HMAC)--> keel /webhook
+   │
+   ▼  push → repo↔service binding → deploy queue
+keel LXC (2xx)
+   │  ssh(forced-command) → utils pve {create-ct,dns,caddy,forward,destroy,status}
+   │  ssh(target LXC)     → git pull + build → symlink swap → systemctl restart
+   ▼
+GitHub Deployments API ← queued/in_progress/success/failure
+```
+
+Bun + TypeScript, hand-rolled JSON-RPC 2.0 over `Bun.serve` (no MCP SDK: its `StreamableHTTPServerTransport` expects Node's `res.writeHead`, incompatible with Bun's fetch-based server). Bearer auth is `timingSafeEqual` over sha256, fail-closed. State lives in Postgres (`keel` schema: desired state; live PVE/LXC is runtime truth), and deploys land on unprivileged, no-nesting LXCs, Capistrano-style.
+
+## keel.yaml
+
+A service repo drops this at its root; `bind_repo` and the webhook read it on every push (full annotated version with all defaults in [`keel.yaml.example`](keel.yaml.example)):
+
+```yaml
+name: pad-core
+runtime: bun
+build:
+  install: bun install --frozen-lockfile
+  command: bun run build
+run:
+  command: bun run start
+port: 8080
+health:
+  url: http://localhost:8080/healthz
+  timeout: 30
+expose:
+  internal: pad-core.internal
+  public: pad-core.app.zyx.tw
+```
+
+`runtime` also accepts `node`, `python`, and `static`, each with its own default `build`/`run` commands so most repos need no overrides at all.
+
+## MCP tools
 
 | Tool | Description |
 |------|-------------|
 | `provision_ct` | Provision a new LXC for a service |
 | `bind_service` | Wire DNS + Caddy routes |
-| `unbind_service` | Cascade destroy: caddy/dns/forward/LXC |
-| `deploy` | Manual deploy: git pull → build → health poll |
-| `rollback` | Revert to previous SHA |
+| `bind_repo` | Bind a GitHub repo for webhook auto-deploy (V2) |
+| `unbind_service` | Remove Caddy + DNS routes (LXC stays) |
+| `deploy` | Manual deploy: clone → build → health poll |
+| `rollback` | Revert to a previous SHA |
 | `status` | Current/previous SHA, health, deploy log tail |
 | `list_services` | Enumerate managed services |
 | `logs` | Per-deployment log stream |
-| `set_secret` | Register a secret key name (value → env_file, never in DB) |
+| `set_secret` | Register a secret key=value (value → LXC env_file, never DB) |
 | `list_secret_keys` | List key names for a service |
 | `destroy_service` | Cascade destroy (requires `confirm: true`) |
 
 ## Security model
 
-- `/mcp` bearer, fail-closed (token unset or < 16 chars → startup abort + 401)
-- `/webhook` HMAC over raw body (V2); stub returns 501 now
-- `utils pve` white-list dispatch only — no raw shell execution paths
-- `build_cmd` is the only arbitrary code execution, sandboxed to the target spoke LXC
-- Secret values never enter Postgres, API responses, build logs, or git
+- `/mcp` bearer, fail-closed: token unset or under 16 chars aborts startup; `/webhook` HMAC-SHA256 over the raw body, verified before `JSON.parse`
+- `/logs/<id>` gated by an unguessable per-deployment token (GitHub can't send the MCP bearer)
+- `utils pve` white-list dispatch only, no raw shell execution path
+- `build.command` / `build.install` are the one accepted arbitrary-code surface, sandboxed to the target spoke LXC
+- Secret values never enter Postgres, API responses, build logs, or git; every mitigation above is tagged inline in source (`THREAT-T-1`, `THREAT-D-1`, ...) for audit
 
 ## Roadmap
 
-| Milestone | Scope |
-|-----------|-------|
-| V1.2 | MCP server scaffold (this) |
-| V1.3 | `keel.yaml` contract parser |
-| V1.4 | Deploy engine (Capistrano-style in-LXC) |
-| V1.5 | MCP tools implementation |
-| V1.6 | systemd unit + LXC bootstrap |
-| V2 | GitHub App + webhook + Deployments API |
-| V3 | Migrate existing services; retire k3s |
+V1.2 through V2 shipped: MCP scaffold, `keel.yaml` parser, deploy engine, MCP tools, LXC bootstrap, GitHub App + webhook + Deployments API. Next up, V3: migrate existing services off k3s onto keel.
+
+## Contributing
+
+Issues and PRs welcome: start with [CONTRIBUTING.md](https://github.com/zyx1121/.github/blob/main/CONTRIBUTING.md).
 
 ## License
 
-MIT
+[MIT](LICENSE) · keeps the fleet pointed straight while everyone else pushes to main
